@@ -1,8 +1,9 @@
-**Prerequisites:**  Node.js
-
+Node.js is required
 
 1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+
+   npm install
+
+2. Run the app:
+
+   npm run dev or run START.bat in the main folder
