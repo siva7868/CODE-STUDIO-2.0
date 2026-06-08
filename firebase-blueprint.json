@@ -1,0 +1,28 @@
+{
+  "entities": {
+    "project": {
+      "title": "Project",
+      "description": "A visual app builder project created by a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique ID of the project" },
+        "name": { "type": "string", "description": "The custom name of the project" },
+        "elements": { "type": "array", "description": "Serialized list of canvas UI elements" },
+        "logicBlocks": { "type": "array", "description": "Serialized list of logic nodes" },
+        "canvasWidth": { "type": "number", "description": "Width of the target design canvas" },
+        "canvasHeight": { "type": "number", "description": "Height of the target design canvas" },
+        "status": { "type": "string", "enum": ["draft", "completed"], "description": "The workflow status of the project" },
+        "userId": { "type": "string", "description": "The UID of the Firebase user who owns this project" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp" }
+      },
+      "required": ["id", "name", "userId", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/projects/{projectId}": {
+      "schema": "project",
+      "description": "Collection of projects stored in Firestore"
+    }
+  }
+}

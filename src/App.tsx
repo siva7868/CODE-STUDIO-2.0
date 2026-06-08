@@ -27,18 +27,34 @@ import {
   CheckCircle2,
   FileText,
   ArrowRight,
-  Github,
-  Twitter,
-  Globe,
   Download,
   Save,
-  Mail,
-  Key
+  Undo2,
+  Redo2,
+  Bug
 } from 'lucide-react';
 import { UIElement, ElementType, ViewMode, LogicBlock } from './types';
 import { cn } from './lib/utils';
 import LogicEditor from './components/LogicEditor';
 import ResultView from './components/ResultView';
+import { auth, db, handleFirestoreError, OperationType } from './lib/firebase';
+import { 
+  onAuthStateChanged, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut,
+  GoogleAuthProvider,
+  signInWithPopup
+} from 'firebase/auth';
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  getDocs, 
+  deleteDoc, 
+  query, 
+  where 
+} from 'firebase/firestore';
 
 interface User {
   id: string;
@@ -83,44 +99,280 @@ export default function App() {
   const [zoom, setZoom] = useState(1);
   const canvasRef = useRef<HTMLDivElement>(null);
 
+  // Undo/Redo & Copy/Paste memory
+  const [copiedElement, setCopiedElement] = useState<UIElement | null>(null);
+  const [history, setHistory] = useState<{ elements: UIElement[]; logicBlocks: LogicBlock[] }[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const isUndoRedoRef = useRef<boolean>(false);
+  const prevHistoryStateRef = useRef<{ elements: UIElement[]; logicBlocks: LogicBlock[] } | null>(null);
+  const [pendingSaveStatus, setPendingSaveStatus] = useState<'draft' | 'completed' | null>(null);
+
+  const startGuestSession = () => {
+    setCurrentProjectId(null);
+    setCurrentProjectName('Guest Project');
+    setElements([]);
+    setLogicBlocks([]);
+    setCanvasWidth(800);
+    setCanvasHeight(600);
+    setHistory([{ elements: [], logicBlocks: [] }]);
+    setHistoryIndex(0);
+    prevHistoryStateRef.current = { elements: [], logicBlocks: [] };
+    setAppState('EDITOR');
+    setModal({ type: null });
+  };
+
   useEffect(() => {
-    const checkAuth = async () => {
-      const token = localStorage.getItem('token');
-      if (token) {
-        try {
-          const res = await fetch('/api/auth/me', {
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-          if (res.ok) {
-            const data = await res.json();
-            setUser(data.user);
-            fetchProjects();
-            if (appState === 'GET_STARTED') setAppState('DASHBOARD');
-          } else {
-            localStorage.removeItem('token');
-            setAppState('GET_STARTED');
-          }
-        } catch (err) {
-          setAppState('GET_STARTED');
-        }
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        setUser({ id: firebaseUser.uid, email: firebaseUser.email || "" });
+        setAppState(prev => prev === 'GET_STARTED' ? 'DASHBOARD' : prev);
       } else {
-        setAppState('GET_STARTED');
+        setUser(null);
+        setProjects([]);
+        setAppState(prev => prev === 'EDITOR' ? 'EDITOR' : 'GET_STARTED');
       }
-    };
-    checkAuth();
+    });
+    return () => unsubscribe();
   }, []);
 
-  const fetchProjects = async () => {
-    const token = localStorage.getItem('token');
-    if (!token) return;
-    try {
-      const res = await fetch('/api/projects', {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setProjects(data);
+  useEffect(() => {
+    if (user) {
+      fetchProjects();
+    }
+  }, [user]);
+
+  // Undo/Redo Handlers
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+      const prevIndex = historyIndex - 1;
+      const prevState = history[prevIndex];
+      isUndoRedoRef.current = true;
+      setElements(prevState.elements);
+      setLogicBlocks(prevState.logicBlocks);
+      setHistoryIndex(prevIndex);
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+      const nextIndex = historyIndex + 1;
+      const nextState = history[nextIndex];
+      isUndoRedoRef.current = true;
+      setElements(nextState.elements);
+      setLogicBlocks(nextState.logicBlocks);
+      setHistoryIndex(nextIndex);
+    }
+  };
+
+  // Automatically track changes to elements and logicBlocks for history stack (Debounced)
+  useEffect(() => {
+    if (appState !== 'EDITOR') {
+      return;
+    }
+
+    if (isUndoRedoRef.current) {
+      isUndoRedoRef.current = false;
+      prevHistoryStateRef.current = { elements, logicBlocks };
+      return;
+    }
+
+    // Initialize with current state if empty
+    if (history.length === 0) {
+      const initialState = {
+        elements: JSON.parse(JSON.stringify(elements)),
+        logicBlocks: JSON.parse(JSON.stringify(logicBlocks))
+      };
+      setHistory([initialState]);
+      setHistoryIndex(0);
+      prevHistoryStateRef.current = initialState;
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      const stateStr = JSON.stringify({ elements, logicBlocks });
+      const prevStr = prevHistoryStateRef.current ? JSON.stringify(prevHistoryStateRef.current) : '';
+
+      if (stateStr !== prevStr) {
+        setHistory((prev) => {
+          const sliced = prev.slice(0, historyIndex + 1);
+          const newState = {
+            elements: JSON.parse(JSON.stringify(elements)),
+            logicBlocks: JSON.parse(JSON.stringify(logicBlocks))
+          };
+          const updated = [...sliced, newState].slice(-50);
+          setHistoryIndex(updated.length - 1);
+          prevHistoryStateRef.current = newState;
+          return updated;
+        });
       }
+    }, 450); // 450ms debounce for typing/dragging
+
+    return () => clearTimeout(timer);
+  }, [elements, logicBlocks, appState, historyIndex, history.length]);
+
+  // Handle Clipboard Image Paste
+  useEffect(() => {
+    const handlePaste = async (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        target.tagName === 'INPUT' || 
+        target.isContentEditable ||
+        target.tagName === 'TEXTAREA'
+      ) {
+        return;
+      }
+
+      if (appState !== 'EDITOR') return;
+
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+          const file = items[i].getAsFile();
+          if (file) {
+            e.preventDefault();
+            const reader = new FileReader();
+            reader.onload = (event) => {
+              const base64Image = event.target?.result as string;
+              if (base64Image) {
+                const newId = `image_${Math.random().toString(36).substr(2, 9)}`;
+                const newImageElement: UIElement = {
+                  id: newId,
+                  type: 'image',
+                  x: 100,
+                  y: 100,
+                  width: 200,
+                  height: 200,
+                  depth: elements.length,
+                  hidden: false,
+                  src: base64Image
+                };
+                setElements(prev => [...prev, newImageElement]);
+                setSelectedId(newId);
+              }
+            };
+            reader.readAsDataURL(file);
+          }
+          return;
+        }
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => {
+      window.removeEventListener('paste', handlePaste);
+    };
+  }, [appState, elements, elements.length]);
+
+  // Keyboard Shortcuts Hook
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't trigger shortcuts if user is typing in an input or textarea
+      const target = e.target as HTMLElement;
+      if (
+        target.tagName === 'INPUT' || 
+        target.isContentEditable ||
+        target.tagName === 'TEXTAREA'
+      ) {
+        return;
+      }
+
+      if (appState !== 'EDITOR') return;
+
+      // 1. Save Project: Ctrl+S / Cmd+S
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        saveProject();
+      }
+
+      // 2. Duplicate Element: Ctrl+D / Cmd+D
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
+        e.preventDefault();
+        if (selectedId) {
+          const elToDuplicate = elements.find(el => el.id === selectedId);
+          if (elToDuplicate) {
+            const newId = `${elToDuplicate.type}_${Math.random().toString(36).substr(2, 9)}`;
+            const duplicated: UIElement = {
+              ...elToDuplicate,
+              id: newId,
+              x: (elToDuplicate.x || 0) + 20,
+              y: (elToDuplicate.y || 0) + 20,
+            };
+            setElements([...elements, duplicated]);
+            setSelectedId(newId);
+          }
+        }
+      }
+
+      // 3. Delete Selected Element: Backspace or Delete
+      if (e.key === 'Backspace' || e.key === 'Delete') {
+        if (selectedId) {
+          e.preventDefault();
+          setElements(elements.filter(el => el.id !== selectedId));
+          setSelectedId(null);
+        }
+      }
+
+      // 4. Undo: Ctrl+Z / Cmd+Z
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        handleUndo();
+      }
+
+      // 5. Redo: Ctrl+Y / Cmd+Y or Ctrl+Shift+Z / Cmd+Shift+Z
+      if (
+        ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') ||
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'z')
+      ) {
+        e.preventDefault();
+        handleRedo();
+      }
+
+      // 6. Copy Element: Ctrl+C / Cmd+C
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+        if (selectedId) {
+          const elToCopy = elements.find(el => el.id === selectedId);
+          if (elToCopy) {
+            e.preventDefault();
+            setCopiedElement(elToCopy);
+          }
+        }
+      }
+
+      // 7. Paste Element: Ctrl+V / Cmd+V
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+        if (copiedElement) {
+          e.preventDefault();
+          const newId = `${copiedElement.type}_${Math.random().toString(36).substr(2, 9)}`;
+          const pasted: UIElement = {
+            ...copiedElement,
+            id: newId,
+            x: (copiedElement.x || 0) + 20,
+            y: (copiedElement.y || 0) + 20,
+            depth: elements.length,
+          };
+          setElements([...elements, pasted]);
+          setSelectedId(newId);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [appState, elements, selectedId, copiedElement, historyIndex, history.length]);
+
+  const fetchProjects = async () => {
+    const currentUser = auth.currentUser;
+    if (!currentUser) return;
+    try {
+      const q = query(collection(db, 'projects'), where('userId', '==', currentUser.uid));
+      const querySnapshot = await getDocs(q);
+      const data = querySnapshot.docs.map(docSnapshot => ({ id: docSnapshot.id, ...docSnapshot.data() }));
+      data.sort((a: any, b: any) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+      setProjects(data);
     } catch (err) {
       console.error("Fetch projects failed:", err);
     }
@@ -129,40 +381,70 @@ export default function App() {
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
-    const endpoint = authMode === 'LOGIN' ? '/api/auth/login' : '/api/auth/signup';
     try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(authForm)
-      });
-      const data = await res.json();
-      if (res.ok) {
-        localStorage.setItem('token', data.token);
-        setUser(data.user);
-        setModal({ type: null });
-        setAppState('DASHBOARD');
-        fetchProjects();
+      if (authMode === 'LOGIN') {
+        const userCredential = await signInWithEmailAndPassword(auth, authForm.email, authForm.password);
+        if (userCredential.user) {
+          setUser({ id: userCredential.user.uid, email: userCredential.user.email || "" });
+          setModal({ type: null });
+          setAppState('DASHBOARD');
+        }
       } else {
-        setAuthError(data.error);
+        const userCredential = await createUserWithEmailAndPassword(auth, authForm.email, authForm.password);
+        if (userCredential.user) {
+          setUser({ id: userCredential.user.uid, email: userCredential.user.email || "" });
+          setModal({ type: null });
+          setAppState('DASHBOARD');
+        }
       }
-    } catch (err) {
-      setAuthError("Authentication failed. Please try again.");
+    } catch (err: any) {
+      console.error("Authentication failed:", err);
+      setAuthError(err.message || "Authentication failed. Please try again.");
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('token');
-    setUser(null);
-    setAppState('GET_STARTED');
+  const handleGoogleSignIn = async () => {
+    setAuthError(null);
+    try {
+      const provider = new GoogleAuthProvider();
+      const userCredential = await signInWithPopup(auth, provider);
+      if (userCredential.user) {
+        setUser({ id: userCredential.user.uid, email: userCredential.user.email || "" });
+        setModal({ type: null });
+        if (appState === 'EDITOR') {
+          saveProject(pendingSaveStatus || 'draft', userCredential.user.uid);
+          setPendingSaveStatus(null);
+        } else {
+          setAppState('DASHBOARD');
+        }
+      }
+    } catch (err: any) {
+      console.error("Google Authentication failed:", err);
+      setAuthError(err.message || "Google Sign-In failed. Please try again.");
+    }
   };
 
-  const saveProject = async (status: 'draft' | 'completed' = 'draft') => {
-    if (!user) return;
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setUser(null);
+      setAppState('GET_STARTED');
+    } catch (err) {
+      console.error("Logout failed:", err);
+    }
+  };
+
+  const saveProject = async (status: 'draft' | 'completed' = 'draft', uidOverride?: string) => {
+    const userId = uidOverride || auth.currentUser?.uid || user?.id;
+    if (!userId) {
+      setPendingSaveStatus(status);
+      setModal({ type: 'AUTH' });
+      return;
+    }
     setIsSaving(true);
     
-    const token = localStorage.getItem('token');
     const projectId = currentProjectId || `proj_${Math.random().toString(36).substr(2, 9)}`;
+    const now = new Date().toISOString();
     const projectData = {
       id: projectId,
       name: currentProjectName,
@@ -170,24 +452,19 @@ export default function App() {
       logicBlocks,
       canvasWidth,
       canvasHeight,
-      status
+      status,
+      userId: userId,
+      createdAt: now,
+      updatedAt: now
     };
 
     try {
-      const res = await fetch('/api/projects', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify(projectData)
-      });
-      if (res.ok) {
-        setCurrentProjectId(projectId);
-        fetchProjects();
-      }
+      await setDoc(doc(db, 'projects', projectId), projectData, { merge: true });
+      setCurrentProjectId(projectId);
+      await fetchProjects();
     } catch (error) {
       console.error("Save failed:", error);
+      handleFirestoreError(error, OperationType.WRITE, `projects/${projectId}`);
     } finally {
       setIsSaving(false);
     }
@@ -196,10 +473,15 @@ export default function App() {
   const loadProject = (project: any) => {
     setCurrentProjectId(project.id);
     setCurrentProjectName(project.name);
-    setElements(project.elements || []);
-    setLogicBlocks(project.logicBlocks || []);
+    const initialElements = project.elements || [];
+    const initialLogicBlocks = project.logicBlocks || [];
+    setElements(initialElements);
+    setLogicBlocks(initialLogicBlocks);
     setCanvasWidth(project.canvasWidth || 800);
     setCanvasHeight(project.canvasHeight || 600);
+    setHistory([{ elements: initialElements, logicBlocks: initialLogicBlocks }]);
+    setHistoryIndex(0);
+    prevHistoryStateRef.current = { elements: initialElements, logicBlocks: initialLogicBlocks };
     setAppState('EDITOR');
   };
 
@@ -216,6 +498,9 @@ export default function App() {
       setLogicBlocks([]);
       setCanvasWidth(800);
       setCanvasHeight(600);
+      setHistory([{ elements: [], logicBlocks: [] }]);
+      setHistoryIndex(0);
+      prevHistoryStateRef.current = { elements: [], logicBlocks: [] };
       setAppState('EDITOR');
       setModal({ type: null });
     }
@@ -228,18 +513,13 @@ export default function App() {
 
   const confirmDeleteProject = async () => {
     if (modal.data) {
-      const token = localStorage.getItem('token');
       try {
-        const res = await fetch(`/api/projects/${modal.data}`, {
-          method: 'DELETE',
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        if (res.ok) {
-          fetchProjects();
-          setModal({ type: null });
-        }
+        await deleteDoc(doc(db, 'projects', modal.data));
+        await fetchProjects();
+        setModal({ type: null });
       } catch (err) {
         console.error("Delete failed:", err);
+        handleFirestoreError(err, OperationType.DELETE, `projects/${modal.data}`);
       }
     }
   };
@@ -481,11 +761,11 @@ export default function App() {
           )}
 
           {modal.type === 'AUTH' && (
-            <form onSubmit={handleAuth} className="space-y-6">
+            <div className="space-y-6">
               <div>
-                <h3 className="text-2xl font-bold mb-2">{authMode === 'LOGIN' ? 'Welcome Back' : 'Create Account'}</h3>
+                <h3 className="text-2xl font-bold mb-2">Access your Projects</h3>
                 <p className="text-neutral-400 text-sm">
-                  {authMode === 'LOGIN' ? 'Enter your credentials to access your projects.' : 'Join CODE STUDIO 2.0 and start building today.'}
+                  Sign in with your Google account to access and resume building on CODE STUDIO 2.0.
                 </p>
               </div>
 
@@ -495,56 +775,43 @@ export default function App() {
                 </div>
               )}
 
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <label className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Email Address</label>
-                  <div className="relative">
-                    <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-500" />
-                    <input 
-                      required
-                      type="email" 
-                      value={authForm.email}
-                      onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
-                      className="w-full bg-neutral-800 border border-neutral-700 rounded-xl pl-11 pr-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                      placeholder="name@example.com"
-                    />
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Password</label>
-                  <div className="relative">
-                    <Key className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-500" />
-                    <input 
-                      required
-                      type="password" 
-                      value={authForm.password}
-                      onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
-                      className="w-full bg-neutral-800 border border-neutral-700 rounded-xl pl-11 pr-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                      placeholder="••••••••"
-                    />
-                  </div>
-                </div>
-              </div>
-
               <div className="space-y-4 pt-2">
                 <button 
-                  type="submit"
-                  className="w-full px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-bold transition-all shadow-lg shadow-blue-500/20 active:scale-95"
+                  type="button"
+                  onClick={handleGoogleSignIn}
+                  className="w-full px-6 py-3 bg-neutral-850 hover:bg-neutral-800 text-white border border-neutral-700/50 hover:border-neutral-500 rounded-xl font-bold transition-all flex items-center justify-center gap-3 active:scale-95 shadow-xl"
                 >
-                  {authMode === 'LOGIN' ? 'Sign In' : 'Create Account'}
+                  <svg className="w-5 h-5 flex-shrink-0" viewBox="0 0 24 24">
+                     <path fill="#EA4335" d="M12 5.04c1.67 0 3.19.57 4.37 1.7l3.26-3.26C17.65 1.57 15.01 1 12 1 7.24 1 3.24 3.74 1.34 7.72l3.86 3C6.12 7.78 8.84 5.04 12 5.04z" />
+                     <path fill="#4285F4" d="M23.49 12.27c0-.81-.07-1.59-.2-2.35H12v4.45h6.45c-.28 1.48-1.12 2.73-2.38 3.58v2.98h3.86c2.25-2.07 3.56-5.12 3.56-8.66z" />
+                     <path fill="#FBBC05" d="M5.2 10.72c-.25-.75-.4-1.56-.4-2.4s.15-1.65.4-2.4l-3.86-3C.48 4.79 0 6.34 0 8a8 8 0 001.34 4.72l3.86-3z" />
+                     <path fill="#34A853" d="M12 23c3.24 0 5.97-1.07 7.96-2.92l-3.86-2.98c-1.1.74-2.52 1.18-4.1 1.18-3.16 0-5.88-2.74-6.84-5.68l-3.86 3C3.24 20.26 7.24 23 12 23z" />
+                  </svg>
+                  <span>Sign In with Google</span>
                 </button>
-                <p className="text-center text-sm text-neutral-500">
-                  {authMode === 'LOGIN' ? "Don't have an account? " : "Already have an account? "}
-                  <button 
+
+                {appState !== 'EDITOR' ? (
+                  <button
                     type="button"
-                    onClick={() => setAuthMode(authMode === 'LOGIN' ? 'SIGNUP' : 'LOGIN')}
-                    className="text-blue-400 font-bold hover:text-blue-300 transition-colors"
+                    onClick={startGuestSession}
+                    className="w-full px-6 py-3 bg-neutral-900 border border-neutral-800 text-neutral-400 hover:text-white rounded-xl font-bold transition-all flex items-center justify-center gap-2 active:scale-95"
                   >
-                    {authMode === 'LOGIN' ? 'Sign Up' : 'Log In'}
+                    Continue without sign in
                   </button>
-                </p>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModal({ type: null });
+                      setPendingSaveStatus(null);
+                    }}
+                    className="w-full px-6 py-3 bg-neutral-900 border border-neutral-850 text-neutral-400 hover:text-white rounded-xl font-bold transition-all flex items-center justify-center gap-2 active:scale-95"
+                  >
+                    Cancel
+                  </button>
+                )}
               </div>
-            </form>
+            </div>
           )}
 
           {modal.type === 'DELETE_CONFIRM' && (
@@ -582,10 +849,7 @@ export default function App() {
       <div className="min-h-screen bg-neutral-950 text-white flex flex-col">
         <header className="h-20 flex items-center justify-between px-10 border-b border-neutral-900 bg-neutral-950/50 backdrop-blur-xl sticky top-0 z-50">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/20">
-              <Layout className="w-6 h-6 text-white" />
-            </div>
-            <h1 className="font-bold text-2xl tracking-tight">CODE STUDIO 2.0</h1>
+            <h1 className="font-black text-2xl tracking-tighter bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">CODE STUDIO 2.0</h1>
           </div>
           <div className="flex items-center gap-6">
             <button onClick={() => { setAuthMode('LOGIN'); setModal({ type: 'AUTH' }); }} className="text-sm font-medium text-neutral-400 hover:text-white transition-colors">Login</button>
@@ -604,16 +868,19 @@ export default function App() {
           <p className="text-xl text-neutral-400 mb-12 max-w-2xl leading-relaxed">
             CODE STUDIO 2.0 is a visual development platform that lets you design, logic-build, and export production-ready HTML apps in minutes. No coding required.
           </p>
-          <div className="flex flex-col sm:flex-row items-center gap-4">
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
             <button 
               onClick={() => { setAuthMode('SIGNUP'); setModal({ type: 'AUTH' }); }}
-              className="px-10 py-4 bg-white text-black hover:bg-neutral-200 rounded-2xl text-lg font-bold transition-all flex items-center gap-3 shadow-xl active:scale-95"
+              className="px-10 py-4 bg-white text-black hover:bg-neutral-200 rounded-2xl text-lg font-bold transition-all flex items-center gap-3 shadow-xl active:scale-95 w-full sm:w-auto justify-center"
             >
               Get Started for Free
               <ArrowRight className="w-5 h-5" />
             </button>
-            <button className="px-10 py-4 bg-neutral-900 hover:bg-neutral-800 text-white border border-neutral-800 rounded-2xl text-lg font-bold transition-all active:scale-95">
-              View Demo
+            <button 
+              onClick={startGuestSession}
+              className="px-10 py-4 bg-neutral-900 border border-neutral-800 text-neutral-300 hover:text-white hover:bg-neutral-800 rounded-2xl text-lg font-bold transition-all active:scale-95 w-full sm:w-auto"
+            >
+              Continue without sign in
             </button>
           </div>
 
@@ -636,12 +903,16 @@ export default function App() {
           </div>
         </main>
 
-        <footer className="py-12 border-t border-neutral-900 bg-neutral-950 flex flex-col items-center gap-6">
-          <div className="flex items-center gap-6 text-neutral-500">
-            <Github className="w-5 h-5 hover:text-white cursor-pointer transition-colors" />
-            <Twitter className="w-5 h-5 hover:text-white cursor-pointer transition-colors" />
-            <Globe className="w-5 h-5 hover:text-white cursor-pointer transition-colors" />
-          </div>
+        <footer className="py-12 border-t border-neutral-900 bg-neutral-950 flex flex-col items-center justify-center gap-4">
+          <a
+            href="https://mail.google.com/mail/?view=cm&fs=1&to=sivagaja2006@gmail.com&su=Code%20Studio%202.0%20-%20Bug%20Report"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 px-4 py-2 bg-neutral-900 hover:bg-neutral-850 hover:text-white border border-neutral-800 rounded-xl text-xs font-semibold text-neutral-400 transition-all hover:border-neutral-700 active:scale-95"
+          >
+            <Bug className="w-3.5 h-3.5 text-rose-500" />
+            Report a bug
+          </a>
           <p className="text-sm text-neutral-600">© 2026 CODE STUDIO 2.0. Built for creators.</p>
         </footer>
 
@@ -655,10 +926,7 @@ export default function App() {
       <div className="min-h-screen bg-neutral-950 text-white flex flex-col">
         <header className="h-16 flex items-center justify-between px-8 border-b border-neutral-900 bg-neutral-950/50 backdrop-blur-xl sticky top-0 z-50">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
-              <Layout className="w-5 h-5 text-white" />
-            </div>
-            <h1 className="font-bold text-xl tracking-tight">CODE STUDIO 2.0</h1>
+            <h1 className="font-black text-xl tracking-tighter bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">CODE STUDIO 2.0</h1>
           </div>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-3 px-3 py-1.5 bg-neutral-900 rounded-xl border border-neutral-800">
@@ -751,8 +1019,11 @@ export default function App() {
       {/* Header */}
       <header className="h-14 border-b border-neutral-800 flex items-center justify-between px-6 bg-neutral-900/50 backdrop-blur-xl z-50">
         <div className="flex items-center gap-3">
-          <button onClick={() => setAppState('DASHBOARD')} className="p-2 hover:bg-neutral-800 rounded-lg text-neutral-400 hover:text-white transition-all">
-            <Layout className="w-5 h-5" />
+          <button 
+            onClick={() => setAppState(user ? 'DASHBOARD' : 'GET_STARTED')} 
+            className="flex items-center gap-1 px-3 py-1.5 hover:bg-neutral-800 rounded-xl text-xs font-bold text-neutral-400 hover:text-white transition-all uppercase tracking-wider"
+          >
+            ← {user ? 'Dashboard' : 'Exit to Home'}
           </button>
           <div className="h-4 w-px bg-neutral-800" />
           <h1 className="font-bold text-sm tracking-tight text-neutral-400">{currentProjectName}</h1>
@@ -792,6 +1063,31 @@ export default function App() {
         </nav>
 
         <div className="flex items-center gap-3">
+          {/* Undo & Redo Controls */}
+          <div className="flex items-center bg-neutral-800 p-0.5 rounded-xl border border-neutral-700/50">
+            <button
+              onClick={handleUndo}
+              disabled={historyIndex <= 0}
+              className="p-1 px-2.5 hover:bg-neutral-700 text-neutral-400 hover:text-white rounded-lg transition-all disabled:opacity-30 disabled:hover:bg-transparent flex items-center gap-1"
+              title="Undo last change (Ctrl+Z)"
+            >
+              <Undo2 className="w-4 h-4" />
+              <span className="text-[10px] font-bold uppercase tracking-wider hidden md:inline">Undo</span>
+            </button>
+            <div className="h-4 w-px bg-neutral-700" />
+            <button
+              onClick={handleRedo}
+              disabled={historyIndex >= history.length - 1}
+              className="p-1 px-2.5 hover:bg-neutral-700 text-neutral-400 hover:text-white rounded-lg transition-all disabled:opacity-30 disabled:hover:bg-transparent flex items-center gap-1"
+              title="Redo next change (Ctrl+Y / Ctrl+Shift+Z)"
+            >
+              <span className="text-[10px] font-bold uppercase tracking-wider hidden md:inline">Redo</span>
+              <Redo2 className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="h-4 w-px bg-neutral-800" />
+
           <button 
             onClick={() => saveProject('draft')}
             disabled={isSaving}

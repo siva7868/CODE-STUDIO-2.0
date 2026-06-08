@@ -500,7 +500,6 @@ interface LogicEditorProps {
 
 export default function LogicEditor({ elements, logicBlocks, setLogicBlocks }: LogicEditorProps) {
   const [nodes, setNodes] = useNodesState([]);
-  const [isInteractive, setIsInteractive] = useState(true);
   const reactFlowInstance = React.useRef<any>(null);
 
   // Sync state to nodes without resetting positions
@@ -525,33 +524,33 @@ export default function LogicEditor({ elements, logicBlocks, setLogicBlocks }: L
             }
           },
           position: existingNode?.position || { x: block.x || 400, y: block.y || (100 + index * 350) },
-          draggable: isInteractive,
-          selectable: isInteractive,
+          draggable: true,
+          selectable: true,
         });
       });
 
       return newNodes;
     });
-  }, [elements, logicBlocks, setLogicBlocks, setNodes, isInteractive]);
+  }, [elements, logicBlocks, setLogicBlocks, setNodes]);
 
-  // Handle node position changes to persist them
+  // Handle node position changes to persist them internally in ReactFlow state
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       setNodes((nds) => applyNodeChanges(changes, nds));
-      
-      // Update logicBlocks with new positions if they were dragged
-      changes.forEach(change => {
-        if (change.type === 'position' && change.position) {
-          const nodeId = change.id;
-          if (!nodeId.startsWith('source_')) {
-            setLogicBlocks(prev => prev.map(b => 
-              b.id === nodeId ? { ...b, x: change.position!.x, y: change.position!.y } : b
-            ));
-          }
-        }
-      });
     },
-    [setNodes, setLogicBlocks]
+    [setNodes]
+  );
+
+  // Persist the final node position to the logicBlocks state only when dragging stops
+  const onNodeDragStop = useCallback(
+    (event: React.MouseEvent, node: Node) => {
+      if (!node.id.startsWith('source_')) {
+        setLogicBlocks(prev => prev.map(b => 
+          b.id === node.id ? { ...b, x: node.position!.x, y: node.position!.y } : b
+        ));
+      }
+    },
+    [setLogicBlocks]
   );
 
   // Auto fit view only once or when number of blocks changes significantly
@@ -615,30 +614,19 @@ export default function LogicEditor({ elements, logicBlocks, setLogicBlocks }: L
         <ReactFlow
           nodes={nodes}
           onNodesChange={onNodesChange}
+          onNodeDragStop={onNodeDragStop}
           onInit={onInit}
           nodeTypes={nodeTypes}
-          nodesDraggable={isInteractive}
+          nodesDraggable={true}
           nodesConnectable={false}
-          elementsSelectable={isInteractive}
-          panOnDrag={!isInteractive || nodes.length === 0}
+          elementsSelectable={true}
+          panOnDrag={true}
         >
           <Background color="#222" gap={20} />
           <Controls />
         </ReactFlow>
         
         <div className="absolute top-4 right-4 z-10 flex items-center gap-3">
-          <button 
-            onClick={() => setIsInteractive(!isInteractive)}
-            className={cn(
-              "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold shadow-2xl transition-all hover:scale-105 active:scale-95",
-              isInteractive ? "bg-neutral-800 text-neutral-400" : "bg-blue-600 text-white"
-            )}
-            title={isInteractive ? "Lock Interactivity" : "Unlock Interactivity"}
-          >
-            {isInteractive ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-            {isInteractive ? "Interactive" : "Locked"}
-          </button>
-
           <button 
             onClick={addLogicBlock}
             className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-sm font-bold shadow-2xl transition-all hover:scale-105 active:scale-95"
