@@ -1,10 +1,29 @@
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore, doc, getDocFromServer } from "firebase/firestore";
-import firebaseConfig from "../../firebase-applet-config.json";
+import defaultFirebaseConfig from "../../firebase-applet-config.json";
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+// Support custom client-side configurations via environment variables (e.g. on Render.com)
+const configFromEnv = {
+  apiKey: (import.meta as any).env.VITE_FIREBASE_API_KEY,
+  authDomain: (import.meta as any).env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: (import.meta as any).env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: (import.meta as any).env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: (import.meta as any).env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: (import.meta as any).env.VITE_FIREBASE_APP_ID,
+  firestoreDatabaseId: (import.meta as any).env.VITE_FIREBASE_FIRESTORE_DATABASE_ID,
+};
+
+const isEnvConfigComplete = !!(configFromEnv.apiKey && configFromEnv.authDomain && configFromEnv.projectId);
+
+const finalFirebaseConfig = isEnvConfigComplete ? configFromEnv : defaultFirebaseConfig;
+
+const app = initializeApp(finalFirebaseConfig);
+
+// AI Studio uses a named database (firestoreDatabaseId), but personal projects usually use the "(default)" database.
+const dbId = finalFirebaseConfig.firestoreDatabaseId || undefined;
+export const db = dbId && dbId !== "(default)" ? getFirestore(app, dbId) : getFirestore(app);
+
 export const auth = getAuth(app);
 
 // Test connection on boot
