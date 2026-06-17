@@ -19,7 +19,14 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
+
+    // ✅ Google Search Console verification
+    app.get("/googlea458e0ec80071416.html", (req, res) => {
+      res.sendFile(path.join(process.cwd(), "public", "googlea458e0ec80071416.html"));
+    });
+
     app.use(express.static(distPath));
+
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
